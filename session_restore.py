@@ -149,16 +149,14 @@ def restore_sessions(state_file: Path | None = None) -> bool:
     _log(f"restore_sessions: state_file={state_file}")
     snapshot = load_snapshot(state_file)
 
-    # Prefer .restored if it has more active sessions (guards against
-    # post-reboot snapshot overwriting a good pre-reboot snapshot)
-    restored_file = state_file.with_suffix(".restored")
-    if restored_file.exists():
-        old = load_snapshot(restored_file)
-        old_sessions = _count_sessions(old.panes) if old else 0
-        cur_sessions = _count_sessions(snapshot.panes) if snapshot else 0
-        if old and (not snapshot or old_sessions > cur_sessions):
-            _log(f"Using .restored ({old_sessions} sessions) over state ({cur_sessions})")
-            snapshot = old
+    # Only use .restored as fallback when primary snapshot is missing/empty
+    if not snapshot or not snapshot.panes:
+        restored_file = state_file.with_suffix(".restored")
+        if restored_file.exists():
+            old = load_snapshot(restored_file)
+            if old and old.panes:
+                _log(f"Primary missing, using .restored ({len(old.panes)} panes, {_count_sessions(old.panes)} sessions)")
+                snapshot = old
 
     if not snapshot or not snapshot.panes:
         _log("No snapshot data, aborting")
