@@ -110,6 +110,16 @@ def snapshot_state() -> SessionSnapshot | None:
 def save_snapshot(snapshot: SessionSnapshot, path: Path | None = None) -> None:
     path = path or STATE_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Keep previous snapshot as .prev.json so restore has a fallback
+    if path.exists() and path.stat().st_size > 2:
+        prev = path.with_suffix(".prev.json")
+        try:
+            import shutil
+            shutil.copy2(path, prev)
+        except OSError:
+            pass
+
     data = {
         "timestamp": snapshot.timestamp,
         "window_geometry": snapshot.window_geometry,
@@ -144,19 +154,26 @@ def _count_sessions(panes: list[TerminalPane]) -> int:
     return sum(1 for p in panes if p.session_id)
 
 
+def _best_snapshot(state_file: Path) -> SessionSnapshot | None:
+    """Pick the snapshot with the most sessions from available files."""
+    candidates: list[tuple[str, SessionSnapshot]] = []
+    for path in [state_file, state_file.with_suffix(".prev.json"), state_file.with_suffix(".restored")]:
+        snap = load_snapshot(path)
+        if snap and snap.panes:
+            _log(f"  candidate {path.name}: {len(snap.panes)} panes, {_count_sessions(snap.panes)} sessions")
+            candidates.append((path.name, snap))
+
+    if not candidates:
+        return None
+    best_name, best = max(candidates, key=lambda c: (_count_sessions(c[1].panes), c[1].timestamp))
+    _log(f"  selected: {best_name}")
+    return best
+
+
 def restore_sessions(state_file: Path | None = None) -> bool:
     state_file = state_file or STATE_FILE
     _log(f"restore_sessions: state_file={state_file}")
-    snapshot = load_snapshot(state_file)
-
-    # Only use .restored as fallback when primary snapshot is missing/empty
-    if not snapshot or not snapshot.panes:
-        restored_file = state_file.with_suffix(".restored")
-        if restored_file.exists():
-            old = load_snapshot(restored_file)
-            if old and old.panes:
-                _log(f"Primary missing, using .restored ({len(old.panes)} panes, {_count_sessions(old.panes)} sessions)")
-                snapshot = old
+    snapshot = _best_snapshot(state_file)
 
     if not snapshot or not snapshot.panes:
         _log("No snapshot data, aborting")
@@ -182,8 +199,16 @@ def restore_sessions(state_file: Path | None = None) -> bool:
         _log("terminator not found")
         return False
 
+    # Clean up all snapshot files after restore
+    for suffix in (".restored", ".prev.json"):
+        old = state_file.with_suffix(suffix)
+        try:
+            if old.exists():
+                old.unlink()
+        except OSError:
+            pass
     try:
-        state_file.rename(restored_file)
+        state_file.rename(state_file.with_suffix(".restored"))
     except OSError:
         pass
 
