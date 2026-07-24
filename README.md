@@ -110,6 +110,30 @@ GRID_LAYOUT = "2x3"                             # Layout for 6 panes: "2x3" / "3
 4. Panes with Claude sessions run `claude --resume <session-id>` automatically
 5. nvm is sourced directly (bypasses `~/.bashrc` interactive guard) to ensure `claude` is in PATH
 
+## Exact Layout Restore (optional plugin)
+
+By default the restore uses an approximated grid (equal splits). To restore
+the **exact** pane arrangement (nesting and split ratios), install the
+included Terminator plugin:
+
+```bash
+mkdir -p ~/.config/terminator/plugins
+cp layout_snapshot.py ~/.config/terminator/plugins/
+```
+
+Then add `LayoutSnapshot` to `enabled_plugins` in `[global_config]` of
+`~/.config/terminator/config`:
+
+```ini
+[global_config]
+  enabled_plugins = LaunchpadBugURLHandler, LaunchpadCodeURLHandler, APTURLHandler, LayoutSnapshot
+```
+
+The plugin dumps the live layout tree to
+`~/.cache/terminator_layout_snapshot.json` every 30 seconds. On restore,
+the tool matches cached terminals to snapshot panes by working directory
+and reproduces the original VPaned/HPaned nesting with real split ratios.
+
 ## File Structure
 
 ```

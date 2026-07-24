@@ -177,6 +177,77 @@ def _best_snapshot(state_file: Path) -> SessionSnapshot | None:
     return best
 
 
+LAYOUT_CACHE = Path.home() / ".cache" / "terminator_layout_snapshot.json"
+
+
+def _layout_from_cache(snapshot: SessionSnapshot) -> dict[str, dict[str, str]] | None:
+    """Rebuild the exact pane arrangement from the LayoutSnapshot plugin cache.
+
+    Requires the layout_snapshot.py terminator plugin (see README).
+    Falls back to None (generic grid) if the cache is missing or stale.
+    """
+    try:
+        data = json.loads(LAYOUT_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    cache_layout = data.get("layout") or {}
+    cache_terms = data.get("terminals") or {}
+    if not cache_layout:
+        return None
+
+    term_nodes = {k: v for k, v in cache_layout.items()
+                  if v.get("type") == "Terminal"}
+    if len(term_nodes) != len(snapshot.panes):
+        return None
+
+    unmatched = list(snapshot.panes)
+
+    def take_pane(cwd: str) -> TerminalPane | None:
+        for i, p in enumerate(unmatched):
+            if p.cwd == cwd:
+                return unmatched.pop(i)
+        return None
+
+    result: dict[str, dict[str, str]] = {}
+    for name, node in cache_layout.items():
+        node_type = node.get("type")
+        parent = node.get("parent", "")
+        order = str(node.get("order", 0))
+
+        if node_type == "Window":
+            geo = snapshot.window_geometry
+            width, rest = geo.split("x", 1)
+            height, pos = rest.split("+", 1)
+            pos_x, pos_y = pos.split("+", 1)
+            result[name] = {
+                "type": "Window",
+                "parent": "",
+                "size": f"{width}, {height}",
+                "position": f"{pos_x}:{pos_y}",
+            }
+        elif node_type in ("VPaned", "HPaned"):
+            entry = {"type": node_type, "parent": parent, "order": order}
+            if node.get("ratio") is not None:
+                entry["ratio"] = str(round(float(node["ratio"]), 4))
+            result[name] = entry
+        elif node_type == "Terminal":
+            uuid = str(node.get("uuid", ""))
+            cwd = (cache_terms.get(uuid) or {}).get("cwd", "")
+            pane = take_pane(cwd)
+            if pane is None:
+                pane = unmatched.pop(0) if unmatched else None
+            if pane is None:
+                return None
+            term = _make_terminal(pane, parent, int(order))
+            term["order"] = order
+            result[name] = term
+        else:
+            return None
+
+    return result
+
+
 def restore_sessions(state_file: Path | None = None) -> bool:
     state_file = state_file or STATE_FILE
     _log(f"restore_sessions: state_file={state_file}")
@@ -187,7 +258,11 @@ def restore_sessions(state_file: Path | None = None) -> bool:
         return False
 
     _log(f"Restoring {len(snapshot.panes)} panes, {_count_sessions(snapshot.panes)} sessions")
-    layout = _generate_layout(snapshot)
+    layout = _layout_from_cache(snapshot)
+    if layout:
+        _log("Using exact layout from plugin cache")
+    else:
+        layout = _generate_layout(snapshot)
     _write_terminator_layout(layout)
 
     geo = snapshot.window_geometry
@@ -325,21 +400,32 @@ def _make_terminal(pane: TerminalPane, parent: str, order: int) -> dict[str, str
     # that prevents nvm from loading in non-interactive `bash -c`.
     # Source nvm directly to ensure node-based CLIs are found.
     nvm_init = 'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+    qdir = shlex.quote(pane.cwd)
+    # Removable media may not be mounted yet at boot — wait up to 60s
+    cd_wait = (
+        f'for i in $(seq 1 30); do [ -d {qdir} ] && break; sleep 2; done; '
+        f'cd {qdir} 2>/dev/null || echo "warning: {pane.cwd} unavailable"'
+    )
 
     if pane.session_id and pane.source == "claude":
         args_str = " ".join(shlex.quote(a) for a in EXTRA_ARGS)
         cmd = (
-            f'{nvm_init}; '
+            f'{nvm_init}; {cd_wait}; '
             f'{shlex.quote(CLAUDE_BIN)} --resume {pane.session_id} {args_str}; '
             f'exec bash'
         )
         terminal["command"] = f"bash -c {shlex.quote(cmd)}"
     elif pane.session_id and pane.source == "codex":
         cmd = (
-            f'{nvm_init}; '
-            f'cd {shlex.quote(pane.cwd)} && codex resume {pane.session_id}; '
+            f'{nvm_init}; {cd_wait}; '
+            f'codex resume {pane.session_id}; '
             f'exec bash'
         )
+        terminal["command"] = f"bash -c {shlex.quote(cmd)}"
+    else:
+        # Empty pane: terminator falls back to $HOME if `directory` doesn't
+        # exist yet (removable media not mounted at boot) — wait then cd.
+        cmd = f'{cd_wait}; exec bash'
         terminal["command"] = f"bash -c {shlex.quote(cmd)}"
 
     return terminal
