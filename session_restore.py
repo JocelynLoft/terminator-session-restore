@@ -32,7 +32,6 @@ LAYOUT_NAME = "recovery"
 CLAUDE_BIN = "claude"
 EXTRA_ARGS = ["--dangerously-skip-permissions"]
 TERMINATOR_BIN = "terminator"
-GRID_LAYOUT = "2x3"  # "2x3", "3x2", or "vertical"
 
 VERBOSE = False
 LOG_FILE = Path("/tmp/session_restore_debug.log")
@@ -82,6 +81,7 @@ def snapshot_state() -> SessionSnapshot | None:
 
     claude_sessions = _get_active_claude_sessions()
     pts_to_session = _map_sessions_to_pts(claude_sessions)
+    pts_to_codex = _map_codex_to_pts()
     bash_panes = _get_bash_panes(terminator_pid)
 
     if not bash_panes:
@@ -90,12 +90,19 @@ def snapshot_state() -> SessionSnapshot | None:
     panes: list[TerminalPane] = []
     for i, (pts, cwd) in enumerate(sorted(bash_panes, key=lambda x: x[0])):
         session_info = pts_to_session.get(pts)
+        codex_id = pts_to_codex.get(pts)
+        if session_info:
+            sid, source = session_info["sessionId"], "claude"
+        elif codex_id:
+            sid, source = codex_id, "codex"
+        else:
+            sid, source = None, None
         panes.append(TerminalPane(
             order=i,
             pts=pts,
             cwd=cwd,
-            session_id=session_info["sessionId"] if session_info else None,
-            source="claude" if session_info else None,
+            session_id=sid,
+            source=source,
         ))
 
     geometry = _get_window_geometry(terminator_pid)
@@ -240,62 +247,70 @@ def _generate_layout(snapshot: SessionSnapshot) -> dict[str, dict[str, str]]:
         layout["terminal0"] = _make_terminal(panes[0], "window0", 0)
         return layout
 
-    if n == 6 and GRID_LAYOUT == "2x3":
-        return _generate_grid_2x3(layout, panes)
-    elif n == 6 and GRID_LAYOUT == "3x2":
-        return _generate_grid_3x2(layout, panes)
+    # Generic grid: 2 columns up to 4 panes, 3 columns beyond
+    cols = 2 if n <= 4 else 3
+    rows = -(-n // cols)  # ceil division
+    row_slices = [panes[r * cols:(r + 1) * cols] for r in range(rows)]
 
-    # Fallback: vertical stack
-    parent = "window0"
-    for i in range(n - 1):
-        pane_name = f"child{i + 1}"
-        ratio = round(1.0 / (n - i), 4)
-        layout[pane_name] = {
+    _build_vpaned_rows(layout, row_slices, "window0", 0)
+    return layout
+
+
+def _build_vpaned_rows(layout: dict, row_slices: list[list[TerminalPane]],
+                       parent: str, order: int) -> None:
+    """Build a vertical chain of rows; each row is a horizontal chain of terminals."""
+    k = len(row_slices)
+    if k == 1:
+        _build_hpaned_row(layout, row_slices[0], parent, order)
+        return
+
+    current_parent = parent
+    current_order = order
+    for r in range(k - 1):
+        node = f"row_v{r}"
+        ratio = round(1.0 / (k - r), 4)
+        layout[node] = {
             "type": "VPaned",
-            "parent": parent,
+            "parent": current_parent,
+            "order": str(current_order),
             "ratio": str(ratio),
         }
-        layout[f"terminal{i}"] = _make_terminal(panes[i], pane_name, 0)
-        if i == n - 2:
-            layout[f"terminal{i + 1}"] = _make_terminal(panes[i + 1], pane_name, 1)
+        _build_hpaned_row(layout, row_slices[r], node, 0)
+        if r == k - 2:
+            _build_hpaned_row(layout, row_slices[r + 1], node, 1)
         else:
-            parent = pane_name
-
-    return layout
-
-
-def _generate_grid_2x3(layout: dict, panes: list[TerminalPane]) -> dict:
-    layout["child_v"] = {"type": "VPaned", "parent": "window0", "ratio": "0.5"}
-
-    layout["child_h_top"] = {"type": "HPaned", "parent": "child_v", "order": "0", "ratio": "0.3333"}
-    layout["terminal0"] = _make_terminal(panes[0], "child_h_top", 0)
-    layout["child_h_top_r"] = {"type": "HPaned", "parent": "child_h_top", "order": "1", "ratio": "0.5"}
-    layout["terminal1"] = _make_terminal(panes[1], "child_h_top_r", 0)
-    layout["terminal2"] = _make_terminal(panes[2], "child_h_top_r", 1)
-
-    layout["child_h_bot"] = {"type": "HPaned", "parent": "child_v", "order": "1", "ratio": "0.3333"}
-    layout["terminal3"] = _make_terminal(panes[3], "child_h_bot", 0)
-    layout["child_h_bot_r"] = {"type": "HPaned", "parent": "child_h_bot", "order": "1", "ratio": "0.5"}
-    layout["terminal4"] = _make_terminal(panes[4], "child_h_bot_r", 0)
-    layout["terminal5"] = _make_terminal(panes[5], "child_h_bot_r", 1)
-    return layout
+            current_parent = node
+            current_order = 1
 
 
-def _generate_grid_3x2(layout: dict, panes: list[TerminalPane]) -> dict:
-    layout["child_v1"] = {"type": "VPaned", "parent": "window0", "ratio": "0.3333"}
-    layout["child_h_row0"] = {"type": "HPaned", "parent": "child_v1", "order": "0", "ratio": "0.5"}
-    layout["terminal0"] = _make_terminal(panes[0], "child_h_row0", 0)
-    layout["terminal1"] = _make_terminal(panes[1], "child_h_row0", 1)
+def _build_hpaned_row(layout: dict, row_panes: list[TerminalPane],
+                      parent: str, order: int) -> None:
+    """Build a horizontal chain of terminals within one row."""
+    m = len(row_panes)
+    if m == 1:
+        p = row_panes[0]
+        layout[f"terminal{p.order}"] = _make_terminal(p, parent, order)
+        return
 
-    layout["child_v2"] = {"type": "VPaned", "parent": "child_v1", "order": "1", "ratio": "0.5"}
-    layout["child_h_row1"] = {"type": "HPaned", "parent": "child_v2", "order": "0", "ratio": "0.5"}
-    layout["terminal2"] = _make_terminal(panes[2], "child_h_row1", 0)
-    layout["terminal3"] = _make_terminal(panes[3], "child_h_row1", 1)
-
-    layout["child_h_row2"] = {"type": "HPaned", "parent": "child_v2", "order": "1", "ratio": "0.5"}
-    layout["terminal4"] = _make_terminal(panes[4], "child_h_row2", 0)
-    layout["terminal5"] = _make_terminal(panes[5], "child_h_row2", 1)
-    return layout
+    current_parent = parent
+    current_order = order
+    for j in range(m - 1):
+        p = row_panes[j]
+        node = f"col_h{p.order}"
+        ratio = round(1.0 / (m - j), 4)
+        layout[node] = {
+            "type": "HPaned",
+            "parent": current_parent,
+            "order": str(current_order),
+            "ratio": str(ratio),
+        }
+        layout[f"terminal{p.order}"] = _make_terminal(p, node, 0)
+        if j == m - 2:
+            last = row_panes[j + 1]
+            layout[f"terminal{last.order}"] = _make_terminal(last, node, 1)
+        else:
+            current_parent = node
+            current_order = 1
 
 
 def _make_terminal(pane: TerminalPane, parent: str, order: int) -> dict[str, str]:
@@ -328,6 +343,49 @@ def _make_terminal(pane: TerminalPane, parent: str, order: int) -> dict[str, str
         terminal["command"] = f"bash -c {shlex.quote(cmd)}"
 
     return terminal
+
+
+_ROLLOUT_RE = re.compile(
+    r"rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+)
+
+
+def _map_codex_to_pts() -> dict[str, str]:
+    """Map pts device -> codex session UUID by scanning codex processes.
+
+    The session UUID is extracted from the open rollout file
+    ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
+    """
+    pts_map: dict[str, str] = {}
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "codex"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return pts_map
+        pids = [p for p in result.stdout.strip().split("\n") if p]
+    except subprocess.TimeoutExpired:
+        return pts_map
+
+    for pid in pids:
+        try:
+            fd0 = os.readlink(f"/proc/{pid}/fd/0")
+            if not fd0.startswith("/dev/pts/"):
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(f"{fd_dir}/{fd}")
+                except OSError:
+                    continue
+                m = _ROLLOUT_RE.search(target)
+                if m and "/.codex/sessions/" in target:
+                    pts_map[fd0] = m.group(1)
+                    break
+        except OSError:
+            continue
+    return pts_map
 
 
 # ============================================================
