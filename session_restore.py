@@ -202,9 +202,10 @@ def restore_sessions(state_file: Path | None = None) -> bool:
         # No --layout: Terminator only applies the injected JSON layout when
         # the layout option is unset or "default" (see /usr/bin/terminator and
         # terminatorlib/ipc.py). The JSON layout has no window size/position,
-        # so geometry is restored via the CLI flag instead.
-        cmd = [TERMINATOR_BIN, "--config-json", str(LAYOUT_JSON),
-               f"--geometry={geo}"]
+        # so geometry is restored via the CLI flag instead — when we have it.
+        cmd = [TERMINATOR_BIN, "--config-json", str(LAYOUT_JSON)]
+        if geo:
+            cmd.append(f"--geometry={geo}")
         _log(f"Launching: {cmd}")
         subprocess.Popen(cmd, start_new_session=True)
     except FileNotFoundError:
@@ -467,6 +468,13 @@ def _get_panes(terminator_pid: int) -> list[tuple[str, str, list[int]]]:
 
 
 def _get_window_geometry(terminator_pid: int) -> str:
+    """Best-effort window geometry, or "" when it can't be determined.
+
+    Returns "" rather than a hardcoded guess: under Wayland, Terminator is a
+    native Wayland client with no X11 window, so xdotool/xwininfo cannot see
+    it at all. Restoring at an invented size is worse than letting Terminator
+    use its own default.
+    """
     try:
         result = subprocess.run(
             ["xdotool", "search", "--pid", str(terminator_pid)],
@@ -475,9 +483,10 @@ def _get_window_geometry(terminator_pid: int) -> str:
         if result.returncode == 0 and result.stdout.strip():
             wid = result.stdout.strip().split("\n")[0]
             return _geometry_from_xwininfo(wid)
+        _log("  geometry unavailable (no X11 window; Wayland session?)")
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return "1800x990+96+71"
+        _log("  geometry unavailable (xdotool missing or timed out)")
+    return ""
 
 
 def _geometry_from_xwininfo(wid: str) -> str:
@@ -487,7 +496,7 @@ def _geometry_from_xwininfo(wid: str) -> str:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
-            return "1800x990+96+71"
+            return ""
 
         width = height = x = y = 0
         for line in result.stdout.splitlines():
@@ -504,7 +513,7 @@ def _geometry_from_xwininfo(wid: str) -> str:
             return f"{width}x{height}+{x}+{y}"
     except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
         pass
-    return "1800x990+96+71"
+    return ""
 
 
 # ============================================================

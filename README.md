@@ -149,7 +149,11 @@ terminator-session-restore/
 
 ## Known Limitations
 
-- **Linux only** — relies on `/proc` filesystem and X11 tools
+- **Linux only** — relies on the `/proc` filesystem
+- **Window size/position is X11-only.** Under Wayland, Terminator is a native
+  Wayland client with no X11 window, so `xdotool`/`xwininfo` cannot see it and
+  geometry is skipped — the window opens at Terminator's default size. Tabs,
+  working directories and session resume are unaffected (all `/proc`-based)
 - **Split layout inside a tab is not preserved.** Each captured pane is restored as
   its own tab with a single terminal; if you had two panes split inside one tab, you
   get two tabs back
