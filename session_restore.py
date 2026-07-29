@@ -25,12 +25,16 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_FILE = SCRIPT_DIR / "data" / "session_state.json"
-TERMINATOR_CONFIG = Path.home() / ".config" / "terminator" / "config"
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-LAYOUT_NAME = "recovery"
+
+# Layout is handed to Terminator as a partial config overlay via
+# `terminator --config-json`. Terminator merges it into its in-memory config
+# only, under the reserved name __internal_json_layout__, which Config.save()
+# explicitly skips. ~/.config/terminator/config is never read or written.
+LAYOUT_JSON = SCRIPT_DIR / "data" / "terminator_layout.json"
 
 CLAUDE_BIN = "claude"
-EXTRA_ARGS = ["--dangerously-skip-permissions"]
+EXTRA_ARGS = []
 TERMINATOR_BIN = "terminator"
 
 VERBOSE = False
@@ -79,24 +83,27 @@ def snapshot_state() -> SessionSnapshot | None:
     if not terminator_pid:
         return None
 
-    claude_sessions = _get_active_claude_sessions()
-    pts_to_session = _map_sessions_to_pts(claude_sessions)
-    pts_to_codex = _map_codex_to_pts()
-    bash_panes = _get_bash_panes(terminator_pid)
+    sessions_by_pid = {s["pid"]: s for s in _get_active_claude_sessions()}
+    codex_by_pid = _map_codex_sessions()
+    raw_panes = _get_panes(terminator_pid)
 
-    if not bash_panes:
+    if not raw_panes:
         return None
 
     panes: list[TerminalPane] = []
-    for i, (pts, cwd) in enumerate(sorted(bash_panes, key=lambda x: x[0])):
-        session_info = pts_to_session.get(pts)
-        codex_id = pts_to_codex.get(pts)
-        if session_info:
-            sid, source = session_info["sessionId"], "claude"
-        elif codex_id:
-            sid, source = codex_id, "codex"
-        else:
-            sid, source = None, None
+    for i, (pts, cwd, subtree) in enumerate(raw_panes):
+        sid = source = None
+        for pid in subtree:
+            if pid in sessions_by_pid:
+                session = sessions_by_pid[pid]
+                sid, source = session["sessionId"], "claude"
+                # The session file records the cwd Claude itself is using,
+                # which beats anything inferred from the process tree.
+                cwd = session.get("cwd") or cwd
+                break
+            if pid in codex_by_pid:
+                sid, source = codex_by_pid[pid], "codex"
+                break
         panes.append(TerminalPane(
             order=i,
             pts=pts,
@@ -177,77 +184,6 @@ def _best_snapshot(state_file: Path) -> SessionSnapshot | None:
     return best
 
 
-LAYOUT_CACHE = Path.home() / ".cache" / "terminator_layout_snapshot.json"
-
-
-def _layout_from_cache(snapshot: SessionSnapshot) -> dict[str, dict[str, str]] | None:
-    """Rebuild the exact pane arrangement from the LayoutSnapshot plugin cache.
-
-    Requires the layout_snapshot.py terminator plugin (see README).
-    Falls back to None (generic grid) if the cache is missing or stale.
-    """
-    try:
-        data = json.loads(LAYOUT_CACHE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
-    cache_layout = data.get("layout") or {}
-    cache_terms = data.get("terminals") or {}
-    if not cache_layout:
-        return None
-
-    term_nodes = {k: v for k, v in cache_layout.items()
-                  if v.get("type") == "Terminal"}
-    if len(term_nodes) != len(snapshot.panes):
-        return None
-
-    unmatched = list(snapshot.panes)
-
-    def take_pane(cwd: str) -> TerminalPane | None:
-        for i, p in enumerate(unmatched):
-            if p.cwd == cwd:
-                return unmatched.pop(i)
-        return None
-
-    result: dict[str, dict[str, str]] = {}
-    for name, node in cache_layout.items():
-        node_type = node.get("type")
-        parent = node.get("parent", "")
-        order = str(node.get("order", 0))
-
-        if node_type == "Window":
-            geo = snapshot.window_geometry
-            width, rest = geo.split("x", 1)
-            height, pos = rest.split("+", 1)
-            pos_x, pos_y = pos.split("+", 1)
-            result[name] = {
-                "type": "Window",
-                "parent": "",
-                "size": f"{width}, {height}",
-                "position": f"{pos_x}:{pos_y}",
-            }
-        elif node_type in ("VPaned", "HPaned"):
-            entry = {"type": node_type, "parent": parent, "order": order}
-            if node.get("ratio") is not None:
-                entry["ratio"] = str(round(float(node["ratio"]), 4))
-            result[name] = entry
-        elif node_type == "Terminal":
-            uuid = str(node.get("uuid", ""))
-            cwd = (cache_terms.get(uuid) or {}).get("cwd", "")
-            pane = take_pane(cwd)
-            if pane is None:
-                pane = unmatched.pop(0) if unmatched else None
-            if pane is None:
-                return None
-            term = _make_terminal(pane, parent, int(order))
-            term["order"] = order
-            result[name] = term
-        else:
-            return None
-
-    return result
-
-
 def restore_sessions(state_file: Path | None = None) -> bool:
     state_file = state_file or STATE_FILE
     _log(f"restore_sessions: state_file={state_file}")
@@ -257,24 +193,18 @@ def restore_sessions(state_file: Path | None = None) -> bool:
         _log("No snapshot data, aborting")
         return False
 
-    _log(f"Restoring {len(snapshot.panes)} panes, {_count_sessions(snapshot.panes)} sessions")
-    layout = _layout_from_cache(snapshot)
-    if layout:
-        _log("Using exact layout from plugin cache")
-    else:
-        layout = _generate_layout(snapshot)
-    _write_terminator_layout(layout)
+    _log(f"Restoring {len(snapshot.panes)} tabs, {_count_sessions(snapshot.panes)} sessions")
+    _write_layout_json(_build_tab_layout(snapshot))
 
     geo = snapshot.window_geometry
-    already_running = subprocess.run(
-        ["pgrep", "-x", "terminator"], capture_output=True
-    ).returncode == 0
 
     try:
-        if already_running:
-            cmd = [TERMINATOR_BIN, "--layout", LAYOUT_NAME]
-        else:
-            cmd = [TERMINATOR_BIN, "--layout", LAYOUT_NAME, f"--geometry={geo}"]
+        # No --layout: Terminator only applies the injected JSON layout when
+        # the layout option is unset or "default" (see /usr/bin/terminator and
+        # terminatorlib/ipc.py). The JSON layout has no window size/position,
+        # so geometry is restored via the CLI flag instead.
+        cmd = [TERMINATOR_BIN, "--config-json", str(LAYOUT_JSON),
+               f"--geometry={geo}"]
         _log(f"Launching: {cmd}")
         subprocess.Popen(cmd, start_new_session=True)
     except FileNotFoundError:
@@ -298,104 +228,46 @@ def restore_sessions(state_file: Path | None = None) -> bool:
 
 
 # ============================================================
-# Layout generation
+# Layout generation — one tab per captured pane
 # ============================================================
 
-def _generate_layout(snapshot: SessionSnapshot) -> dict[str, dict[str, str]]:
-    panes = snapshot.panes
-    n = len(panes)
-    layout: dict[str, dict[str, str]] = {}
+def _build_tab_layout(snapshot: SessionSnapshot) -> dict[str, list[dict[str, str]]]:
+    """Build the partial-config JSON layout: one tab per captured pane.
 
-    geo = snapshot.window_geometry
-    width, rest = geo.split("x", 1)
-    height, pos = rest.split("+", 1)
-    pos_x, pos_y = pos.split("+", 1)
-
-    layout["window0"] = {
-        "type": "Window",
-        "parent": "",
-        "size": f"{width}, {height}",
-        "position": f"{pos_x}:{pos_y}",
-    }
-
-    if n == 1:
-        layout["terminal0"] = _make_terminal(panes[0], "window0", 0)
-        return layout
-
-    # Generic grid: 2 columns up to 4 panes, 3 columns beyond
-    cols = 2 if n <= 4 else 3
-    rows = -(-n // cols)  # ceil division
-    row_slices = [panes[r * cols:(r + 1) * cols] for r in range(rows)]
-
-    _build_vpaned_rows(layout, row_slices, "window0", 0)
-    return layout
+    Terminator takes each tab's label from the dict key and preserves
+    insertion order, so keys must be unique — a duplicate would silently
+    collapse two panes into one tab.
+    """
+    tabs: dict[str, list[dict[str, str]]] = {}
+    for pane in sorted(snapshot.panes, key=lambda p: p.order):
+        tabs[_unique_label(pane, tabs)] = [{"command": _pane_command(pane)}]
+    return tabs
 
 
-def _build_vpaned_rows(layout: dict, row_slices: list[list[TerminalPane]],
-                       parent: str, order: int) -> None:
-    """Build a vertical chain of rows; each row is a horizontal chain of terminals."""
-    k = len(row_slices)
-    if k == 1:
-        _build_hpaned_row(layout, row_slices[0], parent, order)
-        return
-
-    current_parent = parent
-    current_order = order
-    for r in range(k - 1):
-        node = f"row_v{r}"
-        ratio = round(1.0 / (k - r), 4)
-        layout[node] = {
-            "type": "VPaned",
-            "parent": current_parent,
-            "order": str(current_order),
-            "ratio": str(ratio),
-        }
-        _build_hpaned_row(layout, row_slices[r], node, 0)
-        if r == k - 2:
-            _build_hpaned_row(layout, row_slices[r + 1], node, 1)
-        else:
-            current_parent = node
-            current_order = 1
+def _unique_label(pane: TerminalPane, taken: dict[str, Any]) -> str:
+    base = os.path.basename(pane.cwd.rstrip("/")) or "root"
+    label, n = base, 2
+    while label in taken:
+        label = f"{base}~{n}"
+        n += 1
+    return label
 
 
-def _build_hpaned_row(layout: dict, row_panes: list[TerminalPane],
-                      parent: str, order: int) -> None:
-    """Build a horizontal chain of terminals within one row."""
-    m = len(row_panes)
-    if m == 1:
-        p = row_panes[0]
-        layout[f"terminal{p.order}"] = _make_terminal(p, parent, order)
-        return
-
-    current_parent = parent
-    current_order = order
-    for j in range(m - 1):
-        p = row_panes[j]
-        node = f"col_h{p.order}"
-        ratio = round(1.0 / (m - j), 4)
-        layout[node] = {
-            "type": "HPaned",
-            "parent": current_parent,
-            "order": str(current_order),
-            "ratio": str(ratio),
-        }
-        layout[f"terminal{p.order}"] = _make_terminal(p, node, 0)
-        if j == m - 2:
-            last = row_panes[j + 1]
-            layout[f"terminal{last.order}"] = _make_terminal(last, node, 1)
-        else:
-            current_parent = node
-            current_order = 1
+def _write_layout_json(tabs: dict[str, list[dict[str, str]]]) -> None:
+    LAYOUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LAYOUT_JSON.with_name(LAYOUT_JSON.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"layout": tabs}, f, ensure_ascii=False, indent=2)
+    tmp.replace(LAYOUT_JSON)
 
 
-def _make_terminal(pane: TerminalPane, parent: str, order: int) -> dict[str, str]:
-    terminal: dict[str, str] = {
-        "type": "Terminal",
-        "parent": parent,
-        "order": str(order),
-        "directory": pane.cwd,
-    }
+def _pane_command(pane: TerminalPane) -> str:
+    """Build the shell command that restores a single tab.
 
+    The JSON layout format carries no `directory` key (configjson.py only
+    emits `command`), so the working directory is restored by cd-ing inside
+    the command — which the removable-media wait below needed anyway.
+    """
     # ~/.bashrc typically has an interactive-shell guard (case $- in *i*)
     # that prevents nvm from loading in non-interactive `bash -c`.
     # Source nvm directly to ensure node-based CLIs are found.
@@ -404,31 +276,25 @@ def _make_terminal(pane: TerminalPane, parent: str, order: int) -> dict[str, str
     # Removable media may not be mounted yet at boot — wait up to 60s
     cd_wait = (
         f'for i in $(seq 1 30); do [ -d {qdir} ] && break; sleep 2; done; '
-        f'cd {qdir} 2>/dev/null || echo "warning: {pane.cwd} unavailable"'
+        f'cd {qdir} 2>/dev/null || echo warning: {qdir} unavailable'
     )
 
     if pane.session_id and pane.source == "claude":
-        args_str = " ".join(shlex.quote(a) for a in EXTRA_ARGS)
-        cmd = (
-            f'{nvm_init}; {cd_wait}; '
-            f'{shlex.quote(CLAUDE_BIN)} --resume {pane.session_id} {args_str}; '
-            f'exec bash'
-        )
-        terminal["command"] = f"bash -c {shlex.quote(cmd)}"
+        resume = " ".join([shlex.quote(CLAUDE_BIN), "--resume",
+                           shlex.quote(pane.session_id),
+                           *(shlex.quote(a) for a in EXTRA_ARGS)])
     elif pane.session_id and pane.source == "codex":
-        cmd = (
-            f'{nvm_init}; {cd_wait}; '
-            f'codex resume {pane.session_id}; '
-            f'exec bash'
-        )
-        terminal["command"] = f"bash -c {shlex.quote(cmd)}"
+        resume = f'codex resume {shlex.quote(pane.session_id)}'
     else:
-        # Empty pane: terminator falls back to $HOME if `directory` doesn't
-        # exist yet (removable media not mounted at boot) — wait then cd.
-        cmd = f'{cd_wait}; exec bash'
-        terminal["command"] = f"bash -c {shlex.quote(cmd)}"
+        resume = ""
 
-    return terminal
+    # Hand the tab back to the user's own login shell, not hardcoded bash.
+    tail = 'exec "${SHELL:-/bin/sh}"'
+    if resume:
+        cmd = f'{nvm_init}; {cd_wait}; {resume}; {tail}'
+    else:
+        cmd = f'{cd_wait}; {tail}'
+    return f"bash -c {shlex.quote(cmd)}"
 
 
 _ROLLOUT_RE = re.compile(
@@ -436,30 +302,27 @@ _ROLLOUT_RE = re.compile(
 )
 
 
-def _map_codex_to_pts() -> dict[str, str]:
-    """Map pts device -> codex session UUID by scanning codex processes.
+def _map_codex_sessions() -> dict[int, str]:
+    """Map codex pid -> session UUID by scanning codex processes.
 
     The session UUID is extracted from the open rollout file
     ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
     """
-    pts_map: dict[str, str] = {}
+    pid_map: dict[int, str] = {}
     try:
         result = subprocess.run(
             ["pgrep", "-x", "codex"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
-            return pts_map
+            return pid_map
         pids = [p for p in result.stdout.strip().split("\n") if p]
     except subprocess.TimeoutExpired:
-        return pts_map
+        return pid_map
 
     for pid in pids:
+        fd_dir = f"/proc/{pid}/fd"
         try:
-            fd0 = os.readlink(f"/proc/{pid}/fd/0")
-            if not fd0.startswith("/dev/pts/"):
-                continue
-            fd_dir = f"/proc/{pid}/fd"
             for fd in os.listdir(fd_dir):
                 try:
                     target = os.readlink(f"{fd_dir}/{fd}")
@@ -467,84 +330,11 @@ def _map_codex_to_pts() -> dict[str, str]:
                     continue
                 m = _ROLLOUT_RE.search(target)
                 if m and "/.codex/sessions/" in target:
-                    pts_map[fd0] = m.group(1)
+                    pid_map[int(pid)] = m.group(1)
                     break
         except OSError:
             continue
-    return pts_map
-
-
-# ============================================================
-# Terminator config file operations
-# ============================================================
-
-def _write_terminator_layout(layout: dict[str, dict[str, str]]) -> None:
-    TERMINATOR_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-
-    if TERMINATOR_CONFIG.exists():
-        content = TERMINATOR_CONFIG.read_text(encoding="utf-8")
-        lines = _remove_existing_layout(content, LAYOUT_NAME)
-    else:
-        lines = [
-            "[global_config]", "[keybindings]", "[profiles]", "  [[default]]",
-            "[layouts]", "  [[default]]",
-            "    [[[window0]]]", "      type = Window", '      parent = ""',
-            "    [[[child1]]]", "      type = Terminal", "      parent = window0",
-            "[plugins]",
-        ]
-
-    layout_section = _format_layout_section(layout)
-
-    insert_idx = len(lines)
-    in_layouts = False
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped == "[layouts]":
-            in_layouts = True
-            continue
-        if in_layouts and stripped.startswith("[") and not stripped.startswith("[["):
-            insert_idx = i
-            break
-
-    for j, section_line in enumerate(layout_section):
-        lines.insert(insert_idx + j, section_line)
-
-    TERMINATOR_CONFIG.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _remove_existing_layout(content: str, name: str) -> list[str]:
-    lines = content.splitlines()
-    result: list[str] = []
-    skip = False
-    target_header = f"[[{name}]]"
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped == target_header:
-            skip = True
-            continue
-        if skip:
-            if stripped.startswith("[[") and not stripped.startswith("[[["):
-                if stripped != target_header:
-                    skip = False
-            elif stripped.startswith("[") and not stripped.startswith("[["):
-                skip = False
-        if not skip:
-            result.append(line)
-
-    return result
-
-
-def _format_layout_section(layout: dict[str, dict[str, str]]) -> list[str]:
-    lines: list[str] = [f"  [[{LAYOUT_NAME}]]"]
-    for node_name, props in layout.items():
-        lines.append(f"    [[[{node_name}]]]")
-        for key, value in props.items():
-            if key == "parent" and value == "":
-                lines.append(f"      {key} = \"\"")
-            else:
-                lines.append(f"      {key} = {value}")
-    return lines
+    return pid_map
 
 
 # ============================================================
@@ -579,44 +369,100 @@ def _get_active_claude_sessions() -> list[dict[str, Any]]:
     return sessions
 
 
-def _map_sessions_to_pts(sessions: list[dict]) -> dict[str, dict]:
-    pts_map: dict[str, dict] = {}
-    for s in sessions:
-        pid = s["pid"]
+# Any login shell, not just bash — matching on "bash" alone silently finds
+# nothing on a zsh/fish system.
+SHELL_NAMES = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh"})
+# Agents spawn their own throwaway shells for tool calls; those sit deeper in
+# the tree with unrelated cwds, so pane discovery must not descend into them.
+AGENT_NAMES = frozenset({"claude", "codex"})
+
+
+def _proc_table() -> dict[int, tuple[int, str]]:
+    """Map pid -> (ppid, comm) by reading /proc, replacing the pstree dependency."""
+    table: dict[int, tuple[int, str]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
         try:
-            fd0 = os.readlink(f"/proc/{pid}/fd/0")
-            if fd0.startswith("/dev/pts/"):
-                pts_map[fd0] = s
+            stat = Path(f"/proc/{entry}/stat").read_text()
         except OSError:
             continue
-    return pts_map
+        # Field 2 is the comm, wrapped in parentheses; it may itself contain
+        # spaces or ')', so anchor on the *last* ')' rather than splitting.
+        try:
+            close = stat.rindex(")")
+            comm = stat[stat.index("(") + 1:close]
+            ppid = int(stat[close + 2:].split()[1])
+        except (ValueError, IndexError):
+            continue
+        table[int(entry)] = (ppid, comm)
+    return table
 
 
-def _get_bash_panes(terminator_pid: int) -> list[tuple[str, str]]:
+def _children_map(table: dict[int, tuple[int, str]]) -> dict[int, list[int]]:
+    kids: dict[int, list[int]] = {}
+    for pid, (ppid, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    return kids
+
+
+def _subtree(root: int, kids: dict[int, list[int]]) -> list[int]:
+    out: list[int] = []
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        out.append(pid)
+        stack.extend(kids.get(pid, []))
+    return out
+
+
+def _readlink(pid: int, name: str) -> str:
     try:
-        result = subprocess.run(
-            ["pstree", "-p", str(terminator_pid)],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            return []
-    except subprocess.TimeoutExpired:
-        return []
+        return os.readlink(f"/proc/{pid}/{name}")
+    except OSError:
+        return ""
 
-    bash_pids = re.findall(r"bash\((\d+)\)", result.stdout)
-    panes: list[tuple[str, str]] = []
 
-    for pid_str in bash_pids:
-        pid = int(pid_str)
-        try:
-            pts = os.readlink(f"/proc/{pid}/fd/0")
-            if not pts.startswith("/dev/pts/"):
-                continue
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-            panes.append((pts, cwd))
-        except OSError:
+def _deepest_shell_cwd(root: int, kids: dict[int, list[int]],
+                       table: dict[int, tuple[int, str]]) -> str:
+    """cwd of the deepest shell under root, skipping agent-spawned subshells.
+
+    Wrappers such as zsh-smart-suggestions run the real interactive shell one
+    level below Terminator's direct child, leaving the outer shell parked in
+    $HOME — so the deepest shell holds the cwd the user actually sees.
+    """
+    best_depth, best_cwd = -1, ""
+    stack = [(root, 0)]
+    while stack:
+        pid, depth = stack.pop()
+        comm = table.get(pid, (0, ""))[1]
+        if comm in AGENT_NAMES and pid != root:
+            continue  # don't descend into claude/codex tool shells
+        if comm in SHELL_NAMES and depth > best_depth:
+            cwd = _readlink(pid, "cwd")
+            if cwd:
+                best_depth, best_cwd = depth, cwd
+        for kid in kids.get(pid, []):
+            stack.append((kid, depth + 1))
+    return best_cwd
+
+
+def _get_panes(terminator_pid: int) -> list[tuple[str, str, list[int]]]:
+    """One pane per direct child of Terminator, which spawns one shell each.
+
+    Returns (pts, cwd, subtree_pids). Counting direct children avoids the
+    phantom panes that pts-matching produces when a wrapper allocates its own
+    pty in addition to Terminator's.
+    """
+    table = _proc_table()
+    kids = _children_map(table)
+
+    panes: list[tuple[str, str, list[int]]] = []
+    for child in sorted(kids.get(terminator_pid, [])):
+        cwd = _deepest_shell_cwd(child, kids, table) or _readlink(child, "cwd")
+        if not cwd:
             continue
-
+        panes.append((_readlink(child, "fd/0"), cwd, _subtree(child, kids)))
     return panes
 
 

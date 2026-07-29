@@ -6,10 +6,14 @@ If you run multiple Claude Code sessions across Terminator panes, this tool snap
 
 ## Features
 
-- Captures Terminator pane layout, working directories, and active Claude/Codex sessions
-- Restores multi-pane layout with correct grid arrangement (2x3, 3x2, or vertical)
+- Captures each Terminator pane's working directory and active Claude/Codex session
+- Restores **one tab per captured pane**, each in its original working directory
 - Auto-resumes Claude Code sessions via `claude --resume <session-id>`
-- Empty panes restore to their original working directory
+- **Never reads or writes `~/.config/terminator/config`.** The layout is handed to
+  Terminator as an in-memory overlay via `--config-json`; your own config, profiles
+  and keybindings are used untouched
+- Shell-agnostic — works with bash, zsh, fish, and wrappers that spawn a nested shell
+- Restored tabs drop you back into your login shell (`$SHELL`)
 - One-click installer with autostart + optional cron
 
 ## Quick Start
@@ -29,13 +33,13 @@ The installer will:
 
 - **Linux** with X11 (uses `/proc`, `xdotool`, `xwininfo`)
 - **Python 3.10+**
-- **Terminator** terminal emulator
+- **Terminator 2.1+** — needs the `--config-json` flag
 - **Claude Code CLI** (`claude`) installed via npm/nvm
-- System tools: `pstree`, `xdotool`, `xwininfo`
+- System tools: `xdotool`, `xwininfo` (window geometry only)
 
 ```bash
 # Ubuntu/Debian
-sudo apt install terminator psmisc xdotool x11-utils
+sudo apt install terminator xdotool x11-utils
 ```
 
 ## Usage
@@ -85,54 +89,49 @@ python3 session_restore.py -v restore
 Edit the constants at the top of `session_restore.py`:
 
 ```python
-CLAUDE_BIN = "claude"                           # Claude CLI binary name
-EXTRA_ARGS = ["--dangerously-skip-permissions"] # Extra args for claude --resume
-TERMINATOR_BIN = "terminator"                   # Terminator binary name
-GRID_LAYOUT = "2x3"                             # Layout for 6 panes: "2x3" / "3x2" / "vertical"
+CLAUDE_BIN = "claude"          # Claude CLI binary name
+EXTRA_ARGS = []                # Extra args for claude --resume
+TERMINATOR_BIN = "terminator"  # Terminator binary name
 ```
+
+> **Note on `EXTRA_ARGS`:** adding `--dangerously-skip-permissions` here makes every
+> session resume at boot with permission prompts disabled, unattended, in your project
+> directories. Leave it empty unless you fully accept that.
 
 ## How It Works
 
 ### Snapshot
 
-1. `pstree` finds all bash children of the Terminator process
-2. `~/.claude/sessions/*.json` provides active Claude session info (pid, sessionId)
-3. `/proc/<pid>/fd/0` maps Claude processes to their pts device (terminal pane)
-4. `/proc/<pid>/cwd` gets each pane's working directory
+1. `/proc` is walked to find Terminator's direct children — one shell per pane
+2. Each pane's cwd comes from the deepest shell in its subtree, so wrappers that
+   run the interactive shell one level down (e.g. zsh-smart-suggestions) report
+   the directory you actually see rather than `$HOME`
+3. `~/.claude/sessions/*.json` provides active session info (pid, sessionId, cwd);
+   a session is attached to a pane when its pid is anywhere in that pane's subtree
+4. Codex sessions are identified from the open `rollout-*.jsonl` file
 5. `xdotool` + `xwininfo` captures window geometry
 6. State saved as JSON to `data/session_state.json`
 
 ### Restore
 
 1. Reads snapshot JSON
-2. Generates Terminator layout config (`[[recovery]]` section in `~/.config/terminator/config`)
-3. Launches `terminator --layout=recovery`
-4. Panes with Claude sessions run `claude --resume <session-id>` automatically
-5. nvm is sourced directly (bypasses `~/.bashrc` interactive guard) to ensure `claude` is in PATH
+2. Writes a partial-config overlay to `data/terminator_layout.json` — one tab per pane
+3. Launches `terminator --config-json data/terminator_layout.json --geometry=...`
+4. Tabs with Claude sessions run `claude --resume <session-id>` automatically,
+   then hand off to `$SHELL`
+5. nvm is sourced directly (bypasses the `~/.bashrc` interactive guard) to ensure
+   `claude` is in PATH
 
-## Exact Layout Restore (optional plugin)
+### Why your Terminator config is never modified
 
-By default the restore uses an approximated grid (equal splits). To restore
-the **exact** pane arrangement (nesting and split ratios), install the
-included Terminator plugin:
+`--config-json` (Terminator 2.1+) merges the layout into Terminator's **in-memory**
+config under the reserved name `__internal_json_layout__`. Terminator's own
+`Config.save()` explicitly skips that name, so the layout is never persisted — even
+if you open Preferences and change a setting in a restored window. Your real config
+is still loaded normally, so all your profiles, keybindings and plugins apply.
 
-```bash
-mkdir -p ~/.config/terminator/plugins
-cp layout_snapshot.py ~/.config/terminator/plugins/
-```
-
-Then add `LayoutSnapshot` to `enabled_plugins` in `[global_config]` of
-`~/.config/terminator/config`:
-
-```ini
-[global_config]
-  enabled_plugins = LaunchpadBugURLHandler, LaunchpadCodeURLHandler, APTURLHandler, LayoutSnapshot
-```
-
-The plugin dumps the live layout tree to
-`~/.cache/terminator_layout_snapshot.json` every 30 seconds. On restore,
-the tool matches cached terminals to snapshot panes by working directory
-and reproduces the original VPaned/HPaned nesting with real split ratios.
+Since the working directory is restored by `cd`-ing inside each tab's command, the
+layout needs no `directory` key, and no Terminator plugin is required.
 
 ## File Structure
 
@@ -142,15 +141,20 @@ terminator-session-restore/
 ├── install.sh            # One-click installer
 ├── README.md
 ├── LICENSE
-└── data/                 # Auto-created snapshot directory
-    ├── session_state.json      # Current snapshot
-    └── session_state.restored  # Backup after restore
+└── data/                 # Auto-created, git-ignored
+    ├── session_state.json        # Current snapshot
+    ├── session_state.restored    # Backup after restore
+    └── terminator_layout.json    # Generated layout overlay for Terminator
 ```
 
 ## Known Limitations
 
 - **Linux only** — relies on `/proc` filesystem and X11 tools
-- Terminator's DBus API doesn't expose `describe_layout()`, so the actual split ratios are approximated (equal splits)
+- **Split layout inside a tab is not preserved.** Each captured pane is restored as
+  its own tab with a single terminal; if you had two panes split inside one tab, you
+  get two tabs back
+- Tab order follows process-creation order, which usually but not always matches the
+  original tab order
 - Claude `--resume` requires the session history to exist in `~/.claude/`
 - Snapshot overwrite protection: won't overwrite a snapshot with more sessions with one that has fewer
 
@@ -162,7 +166,8 @@ terminator-session-restore/
 
 # terminator-session-restore (中文)
 
-重启电脑后自动恢复 Terminator 终端的多面板布局，并自动 resume 所有 Claude Code / Codex 对话。
+重启电脑后自动恢复 Terminator 的标签页（每个原有面板一个标签页，并回到原工作目录），
+并自动 resume 所有 Claude Code / Codex 对话。
 
 ## 一键安装
 
@@ -179,13 +184,16 @@ chmod +x install.sh && ./install.sh
 
 ## 依赖
 
-- Python 3.10+、Terminator、Claude Code CLI
-- 系统工具：`pstree`, `xdotool`, `xwininfo`
+- Python 3.10+、Terminator 2.1+（需要 `--config-json`）、Claude Code CLI
+- 系统工具：`xdotool`, `xwininfo`
 
 ```bash
 # Ubuntu/Debian
-sudo apt install terminator psmisc xdotool x11-utils
+sudo apt install terminator xdotool x11-utils
 ```
+
+> 本工具不会读写 `~/.config/terminator/config`：布局通过 `--config-json`
+> 仅注入到 Terminator 的内存配置中。每个原有面板恢复为一个独立标签页。
 
 ## 命令
 

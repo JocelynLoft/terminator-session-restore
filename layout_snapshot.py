@@ -1,11 +1,11 @@
 """Terminator plugin: periodically dump the live layout tree to a JSON cache.
 
-Used by terminator-session-restore to reproduce the exact pane arrangement
-(nesting, ratios, order) after reboot, since describe_layout() is not
-exposed over DBus.
+UNUSED / DEPRECATED. session_restore.py no longer reads this cache: it restores
+one tab per pane via `terminator --config-json` instead of reproducing exact
+split geometry. Installing this plugin would also require editing
+~/.config/terminator/config, which the tool now deliberately never touches.
 
-Install: copy to ~/.config/terminator/plugins/ and add "LayoutSnapshot"
-to enabled_plugins in [global_config] of ~/.config/terminator/config.
+Kept only for reference — safe to delete.
 """
 import json
 import os

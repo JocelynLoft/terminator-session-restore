@@ -91,13 +91,10 @@ fi
 
 # ------- [3/4] Helper tools -------
 echo
-echo "[3/4] Checking helper tools (pstree, xdotool, xwininfo)..."
+echo "[3/4] Checking helper tools (xdotool, xwininfo)..."
 
+# Pane discovery reads /proc directly, so pstree/psmisc is not needed.
 NEED_INSTALL=()
-
-if ! command -v pstree &>/dev/null; then
-    NEED_INSTALL+=("psmisc")
-fi
 
 if ! command -v xdotool &>/dev/null; then
     NEED_INSTALL+=("xdotool")
